@@ -38,7 +38,24 @@ curl -s -X POST http://127.0.0.1:7386/v1/lamina/transactions/<id>/commit
 curl -s http://127.0.0.1:7386/v1/lamina/sql -H 'Content-Type: application/json' -d '{"sql":"SELECT sample, amplitude FROM spectra WHERE amplitude >= 20 ORDER BY amplitude DESC LIMIT 10;"}'
 ```
 
-`put` 是完整行替换；缺失的可空列补为 null，缺失的非空列拒绝。主键从新行中取得，不提供原主键重命名操作。删除接口为事务 URL 下的 `delete`，正文为 `{"relation":"spectra","key":1}`；不存在的键也可以形成墓碑。DDL 自身是单个耐久操作，不在用户事务中暂存。
+`put` 是完整行替换；缺失的可空列补为 null，缺失的非空列拒绝。主键从新行中取得，不提供原主键重命名操作。删除接口为事务 URL 下的 `delete`，正文为 `{"relation":"spectra","key":1}`；不存在的键也可以形成墓碑。即时 DDL 自身是单个耐久操作，不在用户事务中暂存。
+
+## 事务内目录变更
+
+除即时 `POST /relations`、`POST /indexes` 外，读写事务还可以把目录变更暂存到私有覆盖层，与同事务的数据写入在一次提交里共同发布：
+
+```sh
+curl -s http://127.0.0.1:7386/v1/lamina/transactions/<id>/relations -H 'Content-Type: application/json' \
+  -d '{"name":"widgets","primary":"id","columns":[{"name":"id","type":"int"},{"name":"label","type":"text"}]}'
+curl -s http://127.0.0.1:7386/v1/lamina/transactions/<id>/indexes -H 'Content-Type: application/json' \
+  -d '{"name":"widget_label","relation":"widgets","column":"label","unique":true}'
+```
+
+返回 `{"state":"staged",...}`。暂存对象在提交前不属于已发布目录：其他读者的 `/catalog` 与查询都看不到，本事务可以向自己暂存的关系写入并通过 `transaction` 读到这些私有行（强制扫描，暂无索引候选）。提交把暂存关系、暂存索引和写集编码进**同一条 commit 日志帧**，一次 fsync 后整体安装，只消耗一个连续序号；提交结果用 `staged_relations`、`staged_indexes` 报告安装的对象数。
+
+这是可选入口，只支持创建关系和创建索引（与即时入口同一组操作），每事务最多暂存 64 个目录对象。名称在暂存时按活动目录和本事务覆盖层检查，提交时在数据库写锁内再次确认：与并发即时 DDL 或先提交事务重名的一方整体失败（409），事务闭合，不留名字占位、不推进序号。新建唯一索引在提交时针对提交后的最终行状态校验（多 null 仍允许），冲突会中止整个事务。回滚直接丢弃私有覆盖层和写集，无需任何补偿删除。
+
+已发布对象的 `created` 取提交序号，因此早于该事务开始的快照仍按旧目录解释读取：它们查不到新关系（410/409），也不会把新索引用到旧查询上。崩溃恢复按单帧原子重放——帧不完整则截断尾部，完整帧损坏则拒绝启动，不会出现半套结构。检查点和备份镜像包含同一序号内安装的目录与首批行。只读事务不能暂存目录变更。
 
 ## 查询与隔离
 
@@ -89,7 +106,7 @@ curl -s http://127.0.0.1:7386/v1/lamina/backup -o /tmp/lamina-backup.lmi
 
 ## 资源与错误
 
-请求体上限 1MiB，列数 64，文本值 64KiB，活动事务 128，每事务最终写集 1000 个键，单日志帧 16MiB，镜像 128MiB。查询最多 32 个 AND 谓词、8 个排序项，默认输出 1000 行，可显式设到 10000；截断时 `truncated=true`。查询执行仍可能物化全部匹配行，事务没有自动过期，排序和备份没有外溢机制，应显式关闭不用的会话并为演练设置合理数据规模。
+请求体上限 1MiB，列数 64，文本值 64KiB，活动事务 128，每事务最终写集 1000 个键，单日志帧 16MiB，镜像 128MiB。每事务暂存目录对象（关系与索引合计）上限 64。查询最多 32 个 AND 谓词、8 个排序项，默认输出 1000 行，可显式设到 10000；截断时 `truncated=true`。查询执行仍可能物化全部匹配行，事务没有自动过期，排序和备份没有外溢机制，应显式关闭不用的会话并为演练设置合理数据规模。
 
 错误 JSON 为 `{"error":{"code":"...","message":"..."}}`。无效输入 400，已关闭或未知事务及缺失行 404，写冲突或唯一冲突 409，快照和变更历史不可用 410，容量拒绝 429，存储不确定或已关闭 503。`GET /stats` 返回会话、版本、候选索引大小、恢复尾字节等领域事实，进程计数在重启后归零。
 

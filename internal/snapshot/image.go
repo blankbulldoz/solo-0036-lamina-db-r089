@@ -100,7 +100,9 @@ func Validate(image Image) error {
 				return fmt.Errorf("empty version chain")
 			}
 			for _, v := range chain {
-				if v.Sequence <= last || v.Sequence > image.Sequence || v.Sequence <= r.Created {
+				// A relation installed by a combined catalog+data commit may
+				// carry its first rows at the relation's own Created sequence.
+				if v.Sequence <= last || v.Sequence > image.Sequence || v.Sequence < r.Created {
 					return fmt.Errorf("invalid version order")
 				}
 				last = v.Sequence

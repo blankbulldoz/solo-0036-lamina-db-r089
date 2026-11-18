@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production walkthroughs using only the public HTTP service."""
 import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
-WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics']
+WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics','txn-catalog']
 class Session:
  def __init__(self,binary,root,restore=None):
   self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None
@@ -152,6 +152,26 @@ def walkthrough(name,binary):
     q=s.query(where=[{'column':'amplitude','op':'>=','value':40}],limit=2)
     require(q['matched']==3 and q['scanned']==3 and len(q['rows'])==2 and q['truncated'],'query fact meanings conflated')
     observations={'query':q,'stats':s.stats()}
+   elif name=='txn-catalog':
+    before=s.stats()['sequence']
+    tx=s.begin()
+    widget={'name':'widgets','primary':'id','columns':[{'name':'id','type':'int'},{'name':'label','type':'text'},{'name':'weight','type':'int','nullable':True}]}
+    s.call('POST',f'/transactions/{tx}/relations',widget,200)
+    s.call('POST',f'/transactions/{tx}/indexes',{'name':'widget_label','relation':'widgets','column':'label','unique':True},200)
+    s.call('POST',f'/transactions/{tx}/put',{'relation':'widgets','row':{'id':1,'label':'a','weight':10}})
+    s.call('POST',f'/transactions/{tx}/put',{'relation':'widgets','row':{'id':2,'label':'b','weight':20}})
+    require('widgets' not in [r['name'] for r in s.call('GET','/catalog')['relations']],'staged relation visible before commit')
+    require(s.call('POST','/query',{'relation':'widgets','transaction':tx})['matched']==2,'read-own staged relation failed')
+    committed=s.commit(tx);require(committed['sequence']==before+1 and committed['staged_relations']==1 and committed['staged_indexes']==1,'combined commit not atomic')
+    cat=s.call('GET','/catalog');require('widgets' in [r['name'] for r in cat['relations']] and 'widget_label' in [i['name'] for i in cat['indexes']],'committed catalog missing objects')
+    loser=s.begin();s.call('POST',f'/transactions/{loser}/indexes',{'name':'dup_label','relation':'widgets','column':'label','unique':True},200)
+    s.call('POST',f'/transactions/{loser}/put',{'relation':'widgets','row':{'id':3,'label':'a'}})
+    s.commit(loser,409);require('dup_label' not in [i['name'] for i in s.call('GET','/catalog')['indexes']] and s.stats()['sequence']==before+1,'failed transactional DDL left a placeholder')
+    rb=s.begin();s.call('POST',f'/transactions/{rb}/relations',{'name':'ghost','primary':'id','columns':[{'name':'id','type':'int'},{'name':'label','type':'text'}]},200)
+    s.call('POST',f'/transactions/{rb}/rollback');require('ghost' not in [r['name'] for r in s.call('GET','/catalog')['relations']],'rollback left staged name')
+    old=s.begin();newer=s.begin();s.call('POST',f'/transactions/{newer}/relations',{'name':'later','primary':'id','columns':[{'name':'id','type':'int'},{'name':'label','type':'text'}]},200);s.commit(newer)
+    s.call('POST','/query',{'relation':'later','transaction':old},410);s.call('POST',f'/transactions/{old}/rollback')
+    observations={'commit':committed,'catalog':cat}
    else:raise ValueError(name)
    return {'workflow':name,'status':'observed','observations':observations}
   finally:

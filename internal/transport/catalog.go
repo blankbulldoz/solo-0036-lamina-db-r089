@@ -37,3 +37,27 @@ func (s *Server) createIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, 201, out)
 }
+func (s *Server) stageRelation(w http.ResponseWriter, r *http.Request) {
+	var in catalog.Relation
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.db.StageRelation(r.PathValue("tx"), in)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, 200, map[string]any{"state": "staged", "relation": out})
+}
+func (s *Server) stageIndex(w http.ResponseWriter, r *http.Request) {
+	var in catalog.Index
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.db.StageIndex(r.PathValue("tx"), in)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, 200, map[string]any{"state": "staged", "index": out})
+}

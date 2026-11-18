@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"lamina/internal/catalog"
 	"lamina/internal/datum"
 	"lamina/internal/journal"
 )
@@ -32,6 +33,43 @@ func (d *DB) apply(r journal.Record) error {
 		}
 		d.catalog.Indexes[r.Index.Name] = *r.Index
 	case "commit":
+		// Staged catalog objects install first, all inside the same record
+		// boundary as the writes: recovery applies the whole frame or rejects
+		// it, never a half-installed structure.
+		seenRelations := map[string]bool{}
+		for idx := range r.Relations {
+			def := r.Relations[idx]
+			if err := def.Validate(); err != nil {
+				return err
+			}
+			if _, ok := d.catalog.Relations[def.Name]; ok || seenRelations[def.Name] {
+				return fmt.Errorf("duplicate relation")
+			}
+			seenRelations[def.Name] = true
+			def.Created = r.Sequence
+			d.catalog.Relations[def.Name] = def
+			d.store.Ensure(def.Name)
+		}
+		seenIndexes := map[string]bool{}
+		for idx := range r.Indexes {
+			def := r.Indexes[idx]
+			if !catalog.ValidName(def.Name) {
+				return fmt.Errorf("invalid index name")
+			}
+			if _, ok := d.catalog.Indexes[def.Name]; ok || seenIndexes[def.Name] {
+				return fmt.Errorf("duplicate index")
+			}
+			relation, err := d.catalog.Relation(def.Relation)
+			if err != nil {
+				return err
+			}
+			if _, ok := relation.Column(def.Column); !ok {
+				return fmt.Errorf("unknown index column")
+			}
+			seenIndexes[def.Name] = true
+			def.Created = r.Sequence
+			d.catalog.Indexes[def.Name] = def
+		}
 		seen := map[string]bool{}
 		for _, m := range r.Writes {
 			relation, err := d.catalog.Relation(m.Relation)

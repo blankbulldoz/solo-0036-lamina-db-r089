@@ -106,7 +106,11 @@ func (d *DB) publish(r journal.Record) error {
 		d.wal.Poisoned = true
 		return fault("unavailable", "durable record cannot be applied: %s", err)
 	}
-	if len(r.Writes) > 0 {
+	if r.Kind == "commit" && (len(r.Relations) > 0 || len(r.Indexes) > 0) {
+		// New or replaced index membership must reflect the committed catalog
+		// (including indexes installed by this record) and the published store.
+		d.indexes = index.Build(d.catalog, d.store)
+	} else if len(r.Writes) > 0 {
 		d.indexes.Apply(d.catalog, r.Writes)
 	}
 	return nil
